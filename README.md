@@ -1,5 +1,4 @@
 # Polity-
-
 <!-- POLITIA: Claude-independent multiplayer build.
      Deploy this single HTML file to any static host (GitHub Pages, Cloudflare Pages, Netlify, etc.).
      Multiplayer transport uses PeerJS/WebRTC; players do not need a Claude account. -->
@@ -311,132 +310,241 @@
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
-/* Politia public multiplayer transport */
-window.PolitiaNet = (() => {
-  let peer = null, host = false, connections = [];
-  const handlers = {};
-  function emit(type, data) {
-    (handlers[type] || []).forEach(fn => fn(data));
-  }
-  function on(type, fn) {
-    (handlers[type] ||= []).push(fn);
-  }
-  function send(data) {
-    connections.forEach(c => { try { if (c.open) c.send(data); } catch(e) {} });
-  }
-  function startHost(roomCode) {
-    return new Promise((resolve, reject) => {
-      host = true;
-      peer = new Peer("politia-" + roomCode, { debug: 0 });
-      peer.on("open", () => resolve());
-      peer.on("error", reject);
-      peer.on("connection", c => {
-        connections.push(c);
-        c.on("data", d => emit("data", {conn:c, data:d}));
-        c.on("close", () => { connections = connections.filter(x => x !== c); });
-      });
-    });
-  }
-  function join(roomCode) {
-    return new Promise((resolve, reject) => {
-      host = false;
-      peer = new Peer(undefined, { debug: 0 });
-      peer.on("open", () => {
-        const c = peer.connect("politia-" + roomCode, {reliable:true});
-        c.on("open", () => {
-          connections = [c];
-          c.on("data", d => emit("data", {conn:c, data:d}));
-          resolve(c);
-        });
-        c.on("error", reject);
-      });
-      peer.on("error", reject);
-    });
-  }
-  return {startHost, join, send, on};
-})();
-</script>
+/* ============================== NETWORK (standalone, no Claude account) ==============================
+   One PeerJS client only. Uses PeerJS Cloud signalling over HTTPS/WSS and WebRTC for the actual game.
+   The UI exposes real connection errors instead of turning every network problem into "wrong code".
+================================================================================ */
 
-</head>
-<body>
-<div id="root"></div>
-
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script>
-/* ============================== NETWORK (standalone, no Claude account) ============================== */
 let netPeer = null;
 let netHost = false;
 let netConn = null;
 let netConnections = [];
 let netPending = {};
 let netSeq = 0;
+let netRoomCode = '';
+
+const PEER_OPTIONS = {
+  host: '0.peerjs.com',
+  port: 443,
+  path: '/',
+  secure: true,
+  debug: 0,
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+    ]
+  }
+};
+
+function netErrorText(err, code, action){
+  const type = err && err.type ? String(err.type) : '';
+  const msg = err && err.message ? String(err.message) : '';
+
+  if(type === 'unavailable-id'){
+    return 'Код комнаты уже занят. Создайте комнату ещё раз.';
+  }
+  if(type === 'peer-unavailable'){
+    return `Комната ${code} не найдена или хост сейчас не подключён.`;
+  }
+  if(type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed'){
+    return `Не удалось связаться с сервером сигнализации PeerJS (${type}). Проверьте интернет/VPN/блокировщик и попробуйте ещё раз.`;
+  }
+  if(type === 'webrtc'){
+    return 'Браузер не смог установить WebRTC-соединение. Попробуйте другую сеть или браузер.';
+  }
+  if(type === 'browser-incompatible'){
+    return 'Этот браузер не поддерживает нужный WebRTC-функционал.';
+  }
+  if(type === 'disconnected'){
+    return 'Соединение с сервером сигнализации потеряно. Попробуйте ещё раз.';
+  }
+  if(msg) return `${action}: ${msg}`;
+  return action;
+}
+
+function netCleanup(){
+  Object.values(netPending).forEach(p => {
+    try { p.reject(new Error('Соединение закрыто')); } catch(e) {}
+  });
+  netPending = {};
+  try { netConn?.close(); } catch(e) {}
+  try { netPeer?.destroy(); } catch(e) {}
+  netPeer = null;
+  netConn = null;
+  netConnections = [];
+  netHost = false;
+}
 
 function netSend(msg, conn){
   try { (conn || netConn)?.send(msg); } catch(e) {}
 }
+
 function netBroadcast(msg){
-  netConnections.forEach(c=>{ try{ if(c.open) c.send(msg); }catch(e){} });
+  netConnections.forEach(c => {
+    try { if(c.open) c.send(msg); } catch(e) {}
+  });
 }
+
 function netWait(id){
   return new Promise((resolve,reject)=>{
     netPending[id]={resolve,reject};
-    setTimeout(()=>{ if(netPending[id]){ delete netPending[id]; reject(new Error('Таймаут соединения')); } }, 8000);
+    setTimeout(()=>{
+      if(netPending[id]){
+        delete netPending[id];
+        reject(new Error('Таймаут ожидания ответа от комнаты'));
+      }
+    }, 10000);
   });
 }
+
 function netHandleMessage(msg, conn){
   if(!msg || !msg.type) return;
+
   if(msg.type==='room-state'){
     const p=netPending[msg.reqId];
-    if(p){ delete netPending[msg.reqId]; p.resolve(msg.state); }
-    else { room=msg.state; if(view==='landing') view=room.status==='playing'?'game':'lobby'; render(); }
+    if(p){
+      delete netPending[msg.reqId];
+      p.resolve(msg.state);
+    } else {
+      room=msg.state;
+      if(view==='landing') view=room.status==='playing'?'game':'lobby';
+      render();
+    }
   } else if(msg.type==='room-request' && netHost){
     netSend({type:'room-state', reqId:msg.reqId, state:room}, conn);
   } else if(msg.type==='room-save' && netHost){
-    // Host is the authoritative relay. Each write is processed in arrival order.
     room=msg.state;
     netBroadcast({type:'room-state', state:room});
   }
 }
+
 function setupConn(conn){
   conn.on('open',()=>{
     if(!netConnections.includes(conn)) netConnections.push(conn);
     if(netHost) netSend({type:'room-state', state:room}, conn);
   });
   conn.on('data',msg=>netHandleMessage(msg,conn));
-  conn.on('close',()=>{ netConnections=netConnections.filter(c=>c!==conn); });
+  conn.on('close',()=>{
+    netConnections=netConnections.filter(c=>c!==conn);
+    if(conn===netConn) netConn=null;
+  });
 }
+
 function initHostNetwork(code){
   return new Promise((resolve,reject)=>{
+    netCleanup();
     netHost=true;
-    netPeer=new Peer('politia-'+code.toLowerCase(), {debug:0});
-    netPeer.on('open',()=>resolve());
-    netPeer.on('connection',conn=>setupConn(conn));
-    netPeer.on('error',err=>{
-      if(err.type==='unavailable-id') reject(new Error('Код комнаты уже занят. Попробуйте создать комнату ещё раз.'));
-      else reject(err);
-    });
+    netRoomCode=code.toUpperCase();
+
+    let settled=false;
+    const fail = err => {
+      if(settled) return;
+      settled=true;
+      const e=new Error(netErrorText(err, netRoomCode, 'Не удалось создать комнату'));
+      e.type=err?.type || '';
+      reject(e);
+    };
+
+    try{
+      netPeer=new Peer('politia-'+netRoomCode.toLowerCase(), PEER_OPTIONS);
+      netPeer.on('open',()=>{
+        if(settled) return;
+        settled=true;
+        resolve();
+      });
+      netPeer.on('connection',conn=>setupConn(conn));
+      netPeer.on('disconnected',()=>{
+        if(!settled) fail({type:'disconnected'});
+      });
+      netPeer.on('error',fail);
+    }catch(err){
+      fail(err);
+    }
   });
 }
+
 function initClientNetwork(code){
   return new Promise((resolve,reject)=>{
+    netCleanup();
     netHost=false;
-    netPeer=new Peer(undefined,{debug:0});
-    netPeer.on('open',()=>{
-      netConn=netPeer.connect('politia-'+code.toLowerCase(),{reliable:true});
-      setupConn(netConn);
-      netConn.on('open',()=>resolve());
-      netConn.on('error',reject);
-    });
-    netPeer.on('error',reject);
+    netRoomCode=code.toUpperCase();
+
+    let settled=false;
+    const fail = err => {
+      if(settled) return;
+      settled=true;
+      const e=new Error(netErrorText(err, netRoomCode, 'Не удалось подключиться к комнате'));
+      e.type=err?.type || '';
+      reject(e);
+    };
+
+    try{
+      netPeer=new Peer(undefined,PEER_OPTIONS);
+
+      netPeer.on('open',()=>{
+        if(settled) return;
+
+        try{
+          netConn=netPeer.connect(
+            'politia-'+netRoomCode.toLowerCase(),
+            {reliable:true}
+          );
+          setupConn(netConn);
+
+          const timer=setTimeout(()=>{
+            if(!settled){
+              try { netConn?.close(); } catch(e) {}
+              fail({type:'peer-unavailable'});
+            }
+          }, 10000);
+
+          netConn.on('open',()=>{
+            if(settled) return;
+            clearTimeout(timer);
+            settled=true;
+            resolve();
+          });
+          netConn.on('error',err=>{
+            clearTimeout(timer);
+            fail(err);
+          });
+          netConn.on('close',()=>{
+            if(!settled){
+              clearTimeout(timer);
+              fail({type:'peer-unavailable'});
+            }
+          });
+        }catch(err){
+          fail(err);
+        }
+      });
+
+      netPeer.on('disconnected',()=>{
+        if(!settled) fail({type:'disconnected'});
+      });
+      netPeer.on('error',err=>{
+        fail(err);
+      });
+    }catch(err){
+      fail(err);
+    }
   });
 }
+
 async function loadRoom(code){
   if(netHost) return room;
   if(!netConn || !netConn.open) return null;
+
   const reqId='q'+(++netSeq);
   netSend({type:'room-request',reqId});
-  try{return await netWait(reqId);}catch(e){return null;}
+
+  try{
+    return await netWait(reqId);
+  }catch(e){
+    return null;
+  }
 }
+
 async function saveRoom(state){
   room=state;
   if(netHost){
@@ -447,6 +555,7 @@ async function saveRoom(state){
 }
 
 /* ============================== DATA ============================== */
+
 
 const PARTIES = {
   ч: { name:'Анархисты',        color:'#2b2b2b' },
